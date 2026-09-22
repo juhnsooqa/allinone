@@ -15,6 +15,9 @@
 #   sudo bash remnawave-node-setup.sh full       # firewall + icmp + nginx + ssl + docker + remnanode
 #   sudo bash remnawave-node-setup.sh fail2ban
 #   sudo bash remnawave-node-setup.sh roscom
+#   sudo bash remnawave-node-setup.sh psiphon         # Psiphon-выход для xray (psiphon/, из Chara-Freedom/vps-psiphon)
+#
+# После первого запуска на сервере есть команда `allinone` (всегда тянет свежую версию с GitHub).
 #   sudo bash remnawave-node-setup.sh accelerator     # optional, 3rd-party
 #   sudo bash remnawave-node-setup.sh reverse-proxy   # optional, 3rd-party
 
@@ -28,6 +31,8 @@ err()  { echo -e "${RED}[x]${NC} $*" >&2; }
 
 STATE_FILE="/root/.remnanode-setup.env"
 NODE_DIR="/opt/remnanode"
+REPO_RAW="https://raw.githubusercontent.com/juhnsooqa/allinone/main"
+CLI_PATH="/usr/local/bin/allinone"
 
 require_root() {
     if [ "$EUID" -ne 0 ]; then
@@ -279,6 +284,17 @@ EOF
 # Reality-ключи панель генерирует сама - сюда они не подставляются.
 write_panel_reference_files() {
     load_common_vars
+
+    # Если стоит vps-psiphon - добавляем его SOCKS-аутбаунд и правило (только TCP: UDP psiphon не умеет).
+    local psi_out="" psi_rule="" psi_bind psi_port
+    if [ -r /etc/default/vps-psiphon ]; then
+        read -r psi_bind psi_port < <(. /etc/default/vps-psiphon; echo "${BIND:-172.17.0.1} ${SOCKS_PORT:-1080}")
+        psi_out=",
+    { \"tag\": \"psiphon-out\", \"protocol\": \"socks\", \"settings\": { \"address\": \"${psi_bind}\", \"port\": ${psi_port} } }"
+        psi_rule="
+      { \"type\": \"field\", \"network\": \"tcp\", \"domain\": [\"geosite:openai\", \"geosite:google-gemini\"], \"outboundTag\": \"psiphon-out\" },"
+    fi
+
     cat > "${NODE_DIR}/panel-profile.reference.json" <<EOF
 {
   "log": { "loglevel": "info" },
@@ -353,10 +369,10 @@ write_panel_reference_files() {
   ],
   "outbounds": [
     { "tag": "DIRECT", "protocol": "freedom" },
-    { "tag": "BLOCK", "protocol": "blackhole" }
+    { "tag": "BLOCK", "protocol": "blackhole" }${psi_out}
   ],
   "routing": {
-    "rules": [
+    "rules": [${psi_rule}
       { "ip": ["ext:geoip.dat:ru"], "type": "field", "outboundTag": "DIRECT" },
       { "type": "field", "protocol": ["bittorrent"], "outboundTag": "BLOCK" }
     ],
@@ -396,7 +412,26 @@ EOF
   "scStreamUpServerSecs": "20-80"
 }
 EOF
-    log "Справочные JSON для панели сохранены в ${NODE_DIR}/panel-*.reference.json"
+    cat > "${NODE_DIR}/panel-hosts.txt" <<EOF
+Хосты в панели Remnawave (Хосты -> Создать). Для каждого выберите свой инбаунд и ноду.
+
+[TCP]   инбаунд NODE_TCP
+  Основные:    Адрес ${DOMAIN}   Порт 44443
+  Расширенные: SNI ${DOMAIN}, "Переопределить SNI из адреса" ВКЛ, остальное пусто/по умолчанию
+
+[XHTTP] инбаунд NODE_XHTTP
+  Основные:    Адрес ${DOMAIN}   Порт 443
+  Расширенные: SNI ${DOMAIN}, "Переопределить SNI из адреса" ВЫКЛ
+               Хост ${DOMAIN}   Путь /xhttppath/
+               Security Layer TLS   ALPN h2,http/1.1   Отпечаток chrome
+  Xray Json & Raw -> xHTTP: содержимое panel-xhttp-host-extra.reference.json
+
+[gRPC]  инбаунд NODE_GRPC
+  Основные:    Адрес ${DOMAIN}   Порт 44444
+  Расширенные: как у TCP (SNI ${DOMAIN}, переопределение SNI ВКЛ)
+EOF
+    cat "${NODE_DIR}/panel-hosts.txt"
+    log "Справочные JSON для панели сохранены в ${NODE_DIR}/panel-*.reference.json, настройки хостов - ${NODE_DIR}/panel-hosts.txt"
     warn "Вставьте их вручную в настройки хостов/профиля Remnawave — путь и Host там уже проставлены на ${DOMAIN}."
     warn "ВАЖНО: в клиентской ссылке path обязан ТОЧНО совпадать (включая слеш на конце) с path на ноде: /xhttppath/"
 }
@@ -517,7 +552,49 @@ EOF
 }
 
 ### ---------------------------------------------------------------------
-### 6. Опциональные сторонние установщики (НЕ встраиваются целиком)
+### 6. Psiphon как выход для xray (psiphon/psiphon_install.sh, из Chara-Freedom/vps-psiphon)
+### ---------------------------------------------------------------------
+setup_psiphon() {
+    warn "Ставить только на зарубежную ноду: трафик Psiphon узнаётся DPI."
+    install_docker
+    local region args=()
+    read -rp "Страна выхода Psiphon (DE или пул DE,NL,FR; Enter = авто): " region
+    [ -n "$region" ] && args=(--region "$region")
+    bash <(curl -fsSL "${REPO_RAW}/psiphon/psiphon_install.sh") "${args[@]}" || { err "Установка Psiphon не удалась."; return 1; }
+    # Пересобираем справочный профиль, чтобы в нём появился psiphon-out
+    [ -f "${NODE_DIR}/panel-profile.reference.json" ] && write_panel_reference_files
+    log "Psiphon установлен. Управление: allinone -> Psiphon, или напрямую: vps-psiphon"
+}
+
+psiphon_menu() {
+    if ! command -v vps-psiphon &>/dev/null; then
+        warn "Psiphon ещё не установлен."
+        read -rp "Установить сейчас? [Y/n]: " a
+        [[ "$a" =~ ^[Nn]$ ]] || setup_psiphon
+        return
+    fi
+    local c v
+    echo -e "${CYAN}${BOLD}=== Psiphon ===${NC}"
+    echo "  1) Статус          5) Логи клиента"
+    echo "  2) Сменить IP      6) Журнал вотчдога"
+    echo "  3) Страна выхода   7) Переустановить/обновить"
+    echo "  4) Тест скорости   8) Удалить"
+    echo "  0) Назад"
+    read -rp "Выбор: " c
+    case "$c" in
+        1) vps-psiphon ;;
+        2) vps-psiphon rotate ;;
+        3) read -rp "Код страны (DE, NL, JP...; auto = любая): " v; vps-psiphon region "$v" ;;
+        4) vps-psiphon speed ;;
+        5) vps-psiphon logs 50 ;;
+        6) vps-psiphon watchdog 50 ;;
+        7) setup_psiphon ;;
+        8) read -rp "Точно удалить Psiphon? [y/N]: " v; [[ "$v" =~ ^[Yy]$ ]] && vps-psiphon uninstall ;;
+    esac
+}
+
+### ---------------------------------------------------------------------
+### 7. Опциональные сторонние установщики (НЕ встраиваются целиком)
 ### ---------------------------------------------------------------------
 run_node_accelerator() {
     warn "Это сторонний репозиторий jestivald/node-accelerator (оптимизация сети/защита, не про Remnawave)."
@@ -562,12 +639,23 @@ full_install() {
 ### ---------------------------------------------------------------------
 ### Меню / CLI
 ### ---------------------------------------------------------------------
+# Команда `allinone` на сервере: каждый раз качает свежий скрипт с GitHub и запускает его.
+install_cli() {
+    cat > "$CLI_PATH" <<EOF
+#!/usr/bin/env bash
+s="\$(curl -fsSL ${REPO_RAW}/remnawave-node-setup.sh)" || { echo "allinone: не удалось скачать скрипт" >&2; exit 1; }
+exec bash -c "\$s" allinone "\$@"
+EOF
+    chmod 755 "$CLI_PATH"
+}
+
 print_menu() {
     clear
     echo -e "${CYAN}${BOLD}=== Remnawave Node Setup ===${NC}"
     echo -e "  ${GREEN}1)${NC} Полная установка ноды (firewall+icmp+nginx+ssl+docker+remnanode)"
     echo -e "  ${GREEN}2)${NC} fail2ban"
     echo -e "  ${GREEN}3)${NC} roscom.dat + автообновление"
+    echo -e "  ${GREEN}6)${NC} Psiphon-выход (установка / управление)"
     echo -e "  ${YELLOW}4)${NC} [опционально, сторонний репо] node-accelerator"
     echo -e "  ${YELLOW}5)${NC} [опционально, сторонний репо] remnawave-reverse-proxy-pro"
     echo -e "  ${RED}0)${NC} Выход"
@@ -576,10 +664,12 @@ print_menu() {
 
 main() {
     require_root
+    install_cli
     case "${1:-}" in
         full)           full_install ;;
         fail2ban)       install_fail2ban ;;
         roscom)         setup_roscom ;;
+        psiphon)        psiphon_menu ;;
         accelerator)    run_node_accelerator ;;
         reverse-proxy)  run_reverse_proxy_pro ;;
         "")
@@ -592,6 +682,7 @@ main() {
                     3) setup_roscom ;;
                     4) run_node_accelerator ;;
                     5) run_reverse_proxy_pro ;;
+                    6) psiphon_menu ;;
                     0) exit 0 ;;
                     *) warn "Неверный выбор" ;;
                 esac
@@ -600,7 +691,7 @@ main() {
             ;;
         *)
             err "Неизвестный аргумент: $1"
-            echo "Использование: $0 [full|fail2ban|roscom|accelerator|reverse-proxy]"
+            echo "Использование: $0 [full|fail2ban|roscom|psiphon|accelerator|reverse-proxy]"
             exit 1
             ;;
     esac
