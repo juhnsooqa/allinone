@@ -665,6 +665,8 @@ print_menu() {
 main() {
     require_root
     install_cli
+    # На свежем VPS apt часто занят unattended-upgrades: пусть все apt (и сторонние установщики) ждут lock до 10 минут, а не падают
+    echo 'DPkg::Lock::Timeout "600";' > /etc/apt/apt.conf.d/99allinone-lock-wait
     case "${1:-}" in
         full)           full_install ;;
         fail2ban)       install_fail2ban ;;
