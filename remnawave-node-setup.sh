@@ -157,7 +157,8 @@ issue_ssl() {
     # configure_nginx всё равно перепишет его после выпуска.
     rm -f /etc/nginx/conf.d/xray.conf
 
-    if ! certbot --nginx -d "$DOMAIN" --non-interactive --agree-tos "${email_args[@]}" --redirect; then
+    # certonly: только выпуск, SSL-конфиг пишет configure_nginx
+    if ! certbot certonly --nginx -d "$DOMAIN" --non-interactive --agree-tos "${email_args[@]}"; then
         warn "certbot не смог выпустить сертификат автоматически."
         warn "Проверьте, что A-запись $DOMAIN указывает на этот сервер, затем выполните вручную:"
         warn "  certbot --nginx -d $DOMAIN"
