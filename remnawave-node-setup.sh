@@ -153,6 +153,10 @@ issue_ssl() {
     local email_args=(--register-unsafely-without-email)
     [ -n "$EMAIL" ] && email_args=(--email "$EMAIL")
 
+    # Старый xray.conf со ссылкой на несуществующий сертификат валит `nginx -t` внутри certbot.
+    # configure_nginx всё равно перепишет его после выпуска.
+    rm -f /etc/nginx/conf.d/xray.conf
+
     if ! certbot --nginx -d "$DOMAIN" --non-interactive --agree-tos "${email_args[@]}" --redirect; then
         warn "certbot не смог выпустить сертификат автоматически."
         warn "Проверьте, что A-запись $DOMAIN указывает на этот сервер, затем выполните вручную:"
@@ -543,7 +547,7 @@ full_install() {
     block_icmp
     install_nginx
     create_stub
-    issue_ssl
+    issue_ssl || { err "Без сертификата дальше нельзя. Исправьте DNS и запустите снова."; return 1; }
     configure_nginx
     install_docker
     setup_remnanode
